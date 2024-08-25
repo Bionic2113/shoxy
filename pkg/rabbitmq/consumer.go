@@ -7,86 +7,67 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type RabbitClient struct {
-	conn                      *amqp.Connection
-	consumeChan               *amqp.Channel
-	pushChan                  *amqp.Channel
-	timeout                   time.Duration
-	pushQueue                 string
-	uri                       string
-	l                         *slog.Logger
+type consumer struct {
 	notifyConnectionClose     chan *amqp.Error
 	notifyConsumeChannelClose chan *amqp.Error
-	notifyPushChannelClose    chan *amqp.Error
+	conn                      *amqp.Connection
+	consumeChan               *amqp.Channel
+	l                         *slog.Logger
+	uri                       string
+	XQueueType                string
 }
 
-func InitRabbitClient(uri, pushQueue string, timeout time.Duration, l *slog.Logger) (*RabbitClient, error) {
-	conn, err := amqp.Dial(uri)
+type ConsumerConfig struct {
+	SendChan       chan<- []byte
+	Url            string
+	Queue          string
+	RecoverTimeout time.Duration
+	XQueueType     string
+}
+
+func NewConsumer(cfg ConsumerConfig, l *slog.Logger) (*consumer, error) {
+	conn, err := amqp.Dial(cfg.Url)
 	if err != nil {
 		return nil, err
 	}
+	l.Info("NewConsumer - after Dial")
 	consumeChan, err := conn.Channel()
 	if err != nil {
 		return nil, err
 	}
-	pushChan, err := conn.Channel()
-	if err != nil {
-		return nil, err
-	}
-	return &RabbitClient{
+	l.Info("NewConsumer - after Channel")
+	c := &consumer{
 		conn:        conn,
 		consumeChan: consumeChan,
-		pushChan:    pushChan,
-		pushQueue:   pushQueue,
-		timeout:     timeout,
-		uri:         uri,
 		l:           l,
-	}, nil
+		XQueueType:  cfg.XQueueType,
+	}
+	go c.StartListenRabbitMQ(cfg.Queue, cfg.SendChan, cfg.RecoverTimeout)
+	l.Info("NewConsumer - after StartListenRabbitMQ")
+	return c, nil
 }
 
-func (rc *RabbitClient) GracefulShutdown() {
+func (rc *consumer) GracefulShutdown() {
 	rc.consumeChan.Close()
-	rc.pushChan.Close()
 	rc.conn.Close()
 }
 
-// func (rc *RabbitClient) PushSession(session sessions.Session) error {
-// 	// TODO: временная заглушка. Костя попросил.
-// 	if rc.pushQueue == "" {
-// 		return nil
-// 	}
-// 	b, err := json.Marshal(session)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	ctx, cancel := context.WithTimeout(context.Background(), rc.timeout)
-// 	defer cancel()
-// 	return rc.pushChan.PublishWithContext(
-// 		ctx,
-// 		"",
-// 		rc.pushQueue,
-// 		false,
-// 		false,
-// 		amqp.Publishing{
-// 			ContentType: "appplication/json",
-// 			Body:        b,
-// 		})
-// }
-
-func (rc *RabbitClient) startListenRabbitMQ(queue string, c chan<- []byte) {
+func (rc *consumer) startListenRabbitMQ(queue string, c chan<- []byte) {
+	rc.l.Info("startListenRabbitMQ - start")
 	_, err := rc.consumeChan.QueueDeclare(
 		queue,
 		true,
 		false,
 		false,
 		false,
-		amqp.Table{"x-queue-type": "quorum"},
+		amqp.Table{"x-queue-type": rc.XQueueType},
 	)
 	if err != nil {
 		rc.l.Error("RabbitClient - startListenRabbitMQ - end", "reason", "consumeChan.QueueDeclare", "error", err)
 		return
 	}
 
+	rc.l.Info("startListenRabbitMQ - after QueueDeclare")
 	msgs, err := rc.consumeChan.Consume(
 		queue, // queue
 		"",    // consumer
@@ -100,6 +81,7 @@ func (rc *RabbitClient) startListenRabbitMQ(queue string, c chan<- []byte) {
 		rc.l.Error("RabbitClient - startListenRabbitMQ - end", "reason", "consumeChan.Consume", "error", err)
 		return
 	}
+	rc.l.Info("RabbitClient - startListenRabbitMQ - consume")
 	for {
 		select {
 		case <-time.After(time.Second):
@@ -113,22 +95,20 @@ func (rc *RabbitClient) startListenRabbitMQ(queue string, c chan<- []byte) {
 		case err := <-rc.notifyConsumeChannelClose:
 			rc.l.Error("RabbitClient - startListenRabbitMQ - end", "reason", "rc.notifyConsumeChannelClose", "error", err)
 			return
-		case err := <-rc.notifyPushChannelClose:
-			rc.l.Error("RabbitClient - startListenRabbitMQ - end", "reason", "rc.notifyPushChannelClose", "error", err)
-			return
 		case d := <-msgs:
 			c <- d.Body
 		}
 	}
 }
 
-func (rc *RabbitClient) StartListenRabbitMQ(queue string, c chan<- []byte) {
+func (rc *consumer) StartListenRabbitMQ(queue string, c chan<- []byte, recoverTimeout time.Duration) {
 	for {
+		rc.l.Info("StartListenRabbitMQ - start")
 		rc.notifyConnectionClose = rc.conn.NotifyClose(make(chan *amqp.Error))
 		rc.notifyConsumeChannelClose = rc.consumeChan.NotifyClose(make(chan *amqp.Error))
-		rc.notifyPushChannelClose = rc.pushChan.NotifyClose(make(chan *amqp.Error))
+		rc.l.Info("StartListenRabbitMQ - call startListenRabbitMQ")
 		rc.startListenRabbitMQ(queue, c)
-		time.Sleep(time.Second * 5) // 5 секунд перерыв, перед попыткой подключиться к RabbitMQ, ведь он не поднимется моментально
+		time.Sleep(recoverTimeout)
 		rc.l.Error("RabbitClient - StartListenRabbitMQ - restart connection")
 
 		for {
@@ -138,6 +118,7 @@ func (rc *RabbitClient) StartListenRabbitMQ(queue string, c chan<- []byte) {
 				break
 			}
 			rc.l.Error("RabbitClient - StartListenRabbitMQ - amqp.Dial", "error", err)
+			time.Sleep(time.Second)
 		}
 		for {
 			consumeChan, err := rc.conn.Channel()
@@ -146,14 +127,7 @@ func (rc *RabbitClient) StartListenRabbitMQ(queue string, c chan<- []byte) {
 				break
 			}
 			rc.l.Error("RabbitClient - StartListenRabbitMQ - conn.Channel for consumeChan", "error", err)
-		}
-		for {
-			pushChan, err := rc.conn.Channel()
-			if err == nil {
-				rc.pushChan = pushChan
-				break
-			}
-			rc.l.Error("RabbitClient - StartListenRabbitMQ - conn.Channel for pushChan", "error", err)
+			time.Sleep(time.Second)
 		}
 	}
 }

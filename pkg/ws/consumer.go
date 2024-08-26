@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 type consumer struct {
@@ -61,24 +61,27 @@ func (c *consumer) handler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-
-	// err := c.Ping(ctx)
-	// 			if err != nil {
-	// 				cs.logger.Error("Server - wsHandler - Ping", "error", err)
-	// 				cancel()
-	// 				cs.errorProcessing(user_id, c)
-	// 				return
-	// 			}
-	msg_t, msg, err := conn.Read(context.TODO())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = conn.Ping(ctx)
 	if err != nil {
-		// cs.logger.Error("Server - wsHandler - Read", "error", err)
-		return
+		c.l.Error("Server - wsHandler - Ping", "error", err)
+		// 				cancel()
+		// 				cs.errorProcessing(user_id, c)
+		// 				return
 	}
-	_ = msg_t // json могут отправлять, а он будет текстовым тогда
-	// поэтому бы не проверял на бинарный тип
-	// if msg_t == websocket.MessageBinary {
-	c.ch <- msg
-	// }
+	for {
+		msg_t, msg, err := conn.Read(context.TODO())
+		if err != nil {
+			// cs.logger.Error("Server - wsHandler - Read", "error", err)
+			return
+		}
+		_ = msg_t // json могут отправлять, а он будет текстовым тогда
+		// поэтому бы не проверял на бинарный тип
+		// if msg_t == websocket.MessageBinary {
+		c.ch <- msg
+		// }
+	}
 }
 
 func (c *consumer) GracefulShutdown() {

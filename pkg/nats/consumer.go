@@ -21,9 +21,10 @@ type ConsumerConfig struct {
 	Description    string
 	Stream         string
 	FilterSubjects []string
+	Chan           chan<- []byte
 }
 
-func NewConsumer(cfg ConsumerConfig, ch chan<- []byte, l *slog.Logger) (*consumer, error) {
+func NewConsumer(cfg ConsumerConfig, l *slog.Logger) (*consumer, error) {
 	conn, err := nats.Connect(cfg.Url)
 	if err != nil {
 		return nil, err
@@ -55,7 +56,7 @@ func NewConsumer(cfg ConsumerConfig, ch chan<- []byte, l *slog.Logger) (*consume
 		// }
 		// log.Printf("Received message sequence: %d; data: %s\n", meta.Sequence.Stream, string(msg.Data()))
 
-		ch <- msg.Data()
+		cfg.Chan <- msg.Data()
 
 		msg.Ack()
 	})

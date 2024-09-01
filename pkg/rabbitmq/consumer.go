@@ -7,52 +7,40 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type consumer struct {
+type Consumer struct {
 	notifyConnectionClose     chan *amqp.Error
 	notifyConsumeChannelClose chan *amqp.Error
 	conn                      *amqp.Connection
 	consumeChan               *amqp.Channel
 	l                         *slog.Logger
-	uri                       string
+	Url                       string
 	XQueueType                string
+	RecoverTimeout            time.Duration
+	SendChan                  chan<- []byte
+	Queue                     string
 }
 
-type ConsumerConfig struct {
-	SendChan       chan<- []byte
-	Url            string
-	Queue          string
-	RecoverTimeout time.Duration
-	XQueueType     string
-}
-
-func NewConsumer(cfg ConsumerConfig, l *slog.Logger) (*consumer, error) {
-	conn, err := amqp.Dial(cfg.Url)
+func (c *Consumer) Connect() error {
+	conn, err := amqp.Dial(c.Url)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	l.Info("NewConsumer - after Dial")
+	c.conn = conn
 	consumeChan, err := conn.Channel()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	l.Info("NewConsumer - after Channel")
-	c := &consumer{
-		conn:        conn,
-		consumeChan: consumeChan,
-		l:           l,
-		XQueueType:  cfg.XQueueType,
-	}
-	go c.StartListenRabbitMQ(cfg.Queue, cfg.SendChan, cfg.RecoverTimeout)
-	l.Info("NewConsumer - after StartListenRabbitMQ")
-	return c, nil
+	c.consumeChan = consumeChan
+	go c.StartListenRabbitMQ(c.Queue, c.SendChan, c.RecoverTimeout)
+	return nil
 }
 
-func (rc *consumer) GracefulShutdown() {
+func (rc *Consumer) GracefulShutdown() {
 	rc.consumeChan.Close()
 	rc.conn.Close()
 }
 
-func (rc *consumer) startListenRabbitMQ(queue string, c chan<- []byte) {
+func (rc *Consumer) startListenRabbitMQ(queue string, c chan<- []byte) {
 	rc.l.Info("startListenRabbitMQ - start")
 	_, err := rc.consumeChan.QueueDeclare(
 		queue,
@@ -101,7 +89,7 @@ func (rc *consumer) startListenRabbitMQ(queue string, c chan<- []byte) {
 	}
 }
 
-func (rc *consumer) StartListenRabbitMQ(queue string, c chan<- []byte, recoverTimeout time.Duration) {
+func (rc *Consumer) StartListenRabbitMQ(queue string, c chan<- []byte, recoverTimeout time.Duration) {
 	for {
 		rc.l.Info("StartListenRabbitMQ - start")
 		rc.notifyConnectionClose = rc.conn.NotifyClose(make(chan *amqp.Error))
@@ -112,7 +100,7 @@ func (rc *consumer) StartListenRabbitMQ(queue string, c chan<- []byte, recoverTi
 		rc.l.Error("RabbitClient - StartListenRabbitMQ - restart connection")
 
 		for {
-			conn, err := amqp.Dial(rc.uri)
+			conn, err := amqp.Dial(rc.Url)
 			if err == nil {
 				rc.conn = conn
 				break

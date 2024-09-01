@@ -9,76 +9,65 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type producer struct {
-	queue                 string
-	l                     *slog.Logger
+type Producer struct {
 	conn                  *amqp.Connection
 	ch                    *amqp.Channel
 	notifyConnectionClose chan *amqp.Error
 	notifyChannelClose    chan *amqp.Error
-	failed                [][]byte
-	pushTimeout           time.Duration
+	Failed                [][]byte
 	mx                    sync.Mutex
+	Url                   string
+	Queue                 string
+	PushTimeout           time.Duration
+	RecoverTimeout        time.Duration
+	CleanFrequency        time.Duration
+	l                     *slog.Logger
 }
 
-type ProducerConfig struct {
-	Url            string
-	Queue          string
-	FailedSize     int64
-	PushTimeout    time.Duration
-	RecoverTimeout time.Duration
-	CleanFrequency time.Duration
-}
-
-func NewProducer(cfg ProducerConfig, l *slog.Logger) (*producer, error) {
-	conn, err := amqp.Dial(cfg.Url)
+func (p *Producer) Connect() error {
+	conn, err := amqp.Dial(p.Url)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	p.conn = conn
 	pushChan, err := conn.Channel()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	p := &producer{
-		conn:        conn,
-		ch:          pushChan,
-		queue:       cfg.Queue,
-		pushTimeout: cfg.PushTimeout,
-		failed:      make([][]byte, 0, cfg.FailedSize),
-		l:           l,
-	}
-	go p.recover(cfg.Url, cfg.RecoverTimeout)
-	go p.cleanFailed(cfg.CleanFrequency)
-	return p, nil
+	p.ch = pushChan
+
+	go p.recover(p.Url, p.RecoverTimeout)
+	go p.cleanFailed(p.CleanFrequency)
+	return nil
 }
 
-func (rc *producer) GracefulShutdown() {
+func (rc *Producer) GracefulShutdown() {
 	rc.ch.Close()
 	rc.conn.Close()
 }
 
-func (rc *producer) Publish(data []byte) error {
+func (rc *Producer) Publish(data []byte) error {
 	if rc.mx.TryLock() {
 		defer rc.mx.Unlock()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), rc.pushTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), rc.PushTimeout)
 	defer cancel()
 	err := rc.ch.PublishWithContext(
 		ctx,
 		"",
-		rc.queue,
+		rc.Queue,
 		false,
 		false,
 		amqp.Publishing{
 			Body: data,
 		})
 	if err != nil {
-		rc.failed = append(rc.failed, data)
+		rc.Failed = append(rc.Failed, data)
 	}
 	return err
 }
 
-func (rc *producer) monitoring() {
+func (rc *Producer) monitoring() {
 	for {
 		select {
 		case <-time.After(time.Second):
@@ -96,9 +85,9 @@ func (rc *producer) monitoring() {
 	}
 }
 
-func (rc *producer) pushFailed() {
-	cp := make([][]byte, len(rc.failed))
-	copy(cp, rc.failed)
+func (rc *Producer) pushFailed() {
+	cp := make([][]byte, len(rc.Failed))
+	copy(cp, rc.Failed)
 	var deleted []int
 	for i, v := range cp {
 		if err := rc.Publish(v); err != nil {
@@ -106,11 +95,11 @@ func (rc *producer) pushFailed() {
 		}
 	}
 	for i := len(deleted) - 1; i >= 0; i-- {
-		rc.failed = append(rc.failed[:deleted[i]], rc.failed[deleted[i]+1:]...)
+		rc.Failed = append(rc.Failed[:deleted[i]], rc.Failed[deleted[i]+1:]...)
 	}
 }
 
-func (rc *producer) cleanFailed(cleanFrequency time.Duration) {
+func (rc *Producer) cleanFailed(cleanFrequency time.Duration) {
 	ticker := time.Tick(cleanFrequency)
 	for range ticker {
 		rc.mx.Lock()
@@ -119,7 +108,7 @@ func (rc *producer) cleanFailed(cleanFrequency time.Duration) {
 	}
 }
 
-func (rc *producer) recover(url string, recoverTimeout time.Duration) {
+func (rc *Producer) recover(url string, recoverTimeout time.Duration) {
 	for {
 		rc.mx.Lock()
 		rc.notifyConnectionClose = rc.conn.NotifyClose(make(chan *amqp.Error))

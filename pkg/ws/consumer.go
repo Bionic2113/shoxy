@@ -3,7 +3,6 @@ package ws
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -11,65 +10,56 @@ import (
 	"github.com/coder/websocket"
 )
 
-type consumer struct {
-	ch             chan<- []byte
-	l              *slog.Logger
-	allowedOrigins []string
-	muxer          http.ServeMux
-	server         http.Server
+type Consumer struct {
+	Ch                 chan<- []byte
+	AllowedOrigins     []string
+	muxer              http.ServeMux
+	Server             http.Server
+	Pattern            string
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	ServerPort         int
+	InsecureSkipVerify bool
 }
 
-type ConsumerConfig struct {
-	Chan           chan<- []byte
-	AllowedOrigins []string
-	Pattern        string
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
-	ServerPort     int
-}
-
-func NewConsumer(cfg ConsumerConfig, l *slog.Logger) (*consumer, error) {
-	c := &consumer{
-		ch:             cfg.Chan,
-		l:              l,
-		allowedOrigins: cfg.AllowedOrigins,
-	}
-	c.muxer.HandleFunc(cfg.Pattern, c.handler)
-	c.server = http.Server{
+func (c *Consumer) Connect() error {
+	c.muxer.HandleFunc(c.Pattern, c.handler)
+	c.Server = http.Server{
 		Handler:      c,
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
+		ReadTimeout:  c.ReadTimeout,
+		WriteTimeout: c.WriteTimeout,
 	}
-	li, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ServerPort))
+	li, err := net.Listen("tcp", fmt.Sprintf(":%d", c.ServerPort))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	go c.server.Serve(li)
-
-	return c, nil
+	go c.Server.Serve(li)
+	return nil
 }
 
-func (c *consumer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (c *Consumer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.muxer.ServeHTTP(w, r)
 }
 
-func (c *consumer) handler(w http.ResponseWriter, r *http.Request) {
+func (c *Consumer) handler(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: c.allowedOrigins,
+		InsecureSkipVerify: c.InsecureSkipVerify,
+		OriginPatterns:     c.AllowedOrigins,
 	})
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err = conn.Ping(ctx)
-	if err != nil {
-		c.l.Error("Server - wsHandler - Ping", "error", err)
-		// 				cancel()
-		// 				cs.errorProcessing(user_id, c)
-		// 				return
-	}
+	// TODO: think about this
+	// ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	// defer cancel()
+	// err = conn.Ping(ctx)
+	// if err != nil {
+	// c.l.Error("Server - wsHandler - Ping", "error", err)
+	// 				cancel()
+	// 				cs.errorProcessing(user_id, c)
+	// 				return
+	// }
 	for {
 		msg_t, msg, err := conn.Read(context.TODO())
 		if err != nil {
@@ -79,11 +69,11 @@ func (c *consumer) handler(w http.ResponseWriter, r *http.Request) {
 		_ = msg_t // json могут отправлять, а он будет текстовым тогда
 		// поэтому бы не проверял на бинарный тип
 		// if msg_t == websocket.MessageBinary {
-		c.ch <- msg
+		c.Ch <- msg
 		// }
 	}
 }
 
-func (c *consumer) GracefulShutdown() {
-	c.server.Close()
+func (c *Consumer) GracefulShutdown() {
+	c.Server.Close()
 }

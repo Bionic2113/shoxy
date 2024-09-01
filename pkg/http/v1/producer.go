@@ -5,20 +5,18 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"time"
 )
 
-type producer struct {
-	client  *http.Client
-	readCh  <-chan []byte
-	writeCh chan<- []byte
-	l       *slog.Logger
-	failed  [][]byte
-	address string
-	timeout time.Duration
-	req     *http.Request
+type Producer struct {
+	Client  *http.Client
+	ReadCh  <-chan []byte
+	WriteCh chan<- []byte
+	Failed  [][]byte
+	Address string
+	Timeout time.Duration
+	Req     *http.Request
 }
 
 type ProducerConfig struct {
@@ -31,94 +29,61 @@ type ProducerConfig struct {
 	Cookie     map[string]string
 }
 
-func NewProducer(ctx context.Context, cfg ProducerConfig, l *slog.Logger) (*producer, error) {
-	req, err := http.NewRequest(http.MethodPost, cfg.Address, bytes.NewReader([]byte{}))
-	if err != nil {
-		return nil, err
-	}
-	req.Header = cfg.Headers
-	for name, value := range cfg.Cookie {
-		req.AddCookie(&http.Cookie{
-			Name:  name,
-			Value: value,
-		})
-	}
-
-	p := &producer{
-		readCh:  cfg.ReadChan,
-		writeCh: cfg.WriteChan,
-		address: cfg.Address,
-		timeout: cfg.Timeout,
-		l:       l,
-		failed:  make([][]byte, 0, cfg.FailedSize),
-		client: &http.Client{
-			Transport: http.DefaultTransport,
-			Timeout:   cfg.Timeout,
-		},
-		req: req,
-	}
+func (p *Producer) Connect(ctx context.Context) {
 	go p.monitoring(ctx)
-	return p, nil
 }
 
-func (p *producer) monitoring(ctx context.Context) {
+func (p *Producer) monitoring(ctx context.Context) {
 	for {
 		p.connect(ctx)
 	}
 }
 
-func (p *producer) connect(ctx context.Context) {
-	newCtx, cancel := context.WithTimeout(ctx, p.timeout)
+func (p *Producer) connect(ctx context.Context) {
+	newCtx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
-	p.req = p.req.WithContext(newCtx)
+	p.Req = p.Req.WithContext(newCtx)
 	p.sendFailed(ctx)
 
-	for msg := range p.readCh {
-		p.l.Info("HttpProducer - ", "action", "сейчас буду отправлять", "data", string(msg))
+	for msg := range p.ReadCh {
 		if err := p.send(ctx, msg); err != nil {
-			p.l.Error("HttpProducer - Write", "error", err)
 			return
 		}
-		p.l.Info("HttpProducer - ", "action", "отправил", "data", string(msg))
 	}
-	p.l.Info("HttpProducer - - end")
 }
 
-func (p *producer) send(ctx context.Context, msg []byte) (err error) {
+func (p *Producer) send(ctx context.Context, msg []byte) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			p.l.Warn("")
 			err = fmt.Errorf("panic has been caught: %v", rec)
 		}
 	}()
 
-	newCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	newCtx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
 
-	p.req = p.req.WithContext(newCtx)
-	p.req.Body = io.NopCloser(bytes.NewReader(msg))
+	p.Req = p.Req.WithContext(newCtx)
+	p.Req.Body = io.NopCloser(bytes.NewReader(msg))
 
-	resp, err := p.client.Do(p.req)
+	resp, err := p.Client.Do(p.Req)
 	if err != nil {
-		p.failed = append(p.failed, msg)
-		p.l.Error("")
+		p.Failed = append(p.Failed, msg)
 		return err
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
 	if err = resp.Write(&buf); err != nil {
-		p.l.Error("")
 		return
 	}
 
-	p.writeCh <- buf.Bytes()
+	p.WriteCh <- buf.Bytes()
 
 	return
 }
 
-func (p *producer) sendFailed(ctx context.Context) {
-	cp := make([][]byte, len(p.failed))
-	copy(cp, p.failed)
+func (p *Producer) sendFailed(ctx context.Context) {
+	cp := make([][]byte, len(p.Failed))
+	copy(cp, p.Failed)
 	var deleted []int
 	for i, v := range cp {
 		if err := p.send(ctx, v); err != nil {
@@ -126,12 +91,12 @@ func (p *producer) sendFailed(ctx context.Context) {
 		}
 	}
 	for i := len(deleted) - 1; i >= 0; i-- {
-		p.failed = append(p.failed[:deleted[i]], p.failed[deleted[i]+1:]...)
+		p.Failed = append(p.Failed[:deleted[i]], p.Failed[deleted[i]+1:]...)
 	}
 }
 
-func (p *producer) GracefulShutdown() {
-	if p.client != nil {
-		p.client.CloseIdleConnections()
+func (p *Producer) GracefulShutdown() {
+	if p.Client != nil {
+		p.Client.CloseIdleConnections()
 	}
 }
